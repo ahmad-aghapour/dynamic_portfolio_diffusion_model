@@ -1,0 +1,9 @@
+numpy
+pandas
+torch
+matplotlib
+tqdm
+scipy
+cvxpy
+notebook
+nbformat

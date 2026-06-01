@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "portfolio-diffusion"
+version = "0.1.0"
+description = "Conditional recurrent diffusion scenario generation for dynamic portfolio experiments"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["portfolio_diffusion*"]
