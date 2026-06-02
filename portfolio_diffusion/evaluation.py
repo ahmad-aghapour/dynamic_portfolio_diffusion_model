@@ -1,132 +1,79 @@
 from __future__ import annotations
 
-from typing import Dict, Tuple
-
 import numpy as np
+import torch
 import pandas as pd
 
 
-def acf1_numpy_centered(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    """
-    Compute lag-1 autocorrelation per asset after demeaning each asset.
-
-    Parameters
-    ----------
-    x:
-        Array with shape [time, num_assets].
-
-    Returns
-    -------
-    np.ndarray
-        Lag-1 autocorrelation for each asset, shape [num_assets].
-    """
-    x = np.asarray(x, dtype=np.float64)
-    if x.ndim != 2:
-        raise ValueError(f"x must have shape [time, num_assets], got {x.shape}")
-    if x.shape[0] < 2:
-        return np.full(x.shape[1], np.nan)
-
-    centered = x - x.mean(axis=0, keepdims=True)
-    num = (centered[:-1] * centered[1:]).mean(axis=0)
-    den = (centered * centered).mean(axis=0) + eps
+def acf1_numpy_centered(x: np.ndarray) -> np.ndarray:
+    """Centered lag-1 autocorrelation for a [T, D] array."""
+    x = np.asarray(x)
+    x = x - x.mean(axis=0, keepdims=True)
+    num = (x[:-1] * x[1:]).mean(axis=0)
+    den = (x * x).mean(axis=0) + 1e-8
     return num / den
 
 
-def generated_path_diagnostics(
-    real_series: np.ndarray,
-    generated_paths: np.ndarray,
-    asset_names=None,
-) -> Tuple[pd.DataFrame, Dict[str, float]]:
+def acf1_torch_scenarios_centered(x: torch.Tensor) -> torch.Tensor:
+    """Centered lag-1 autocorrelation for generated paths [horizon, num_samples, D]."""
+    x = x - x.mean(dim=(0, 1), keepdim=True)
+    x0 = x[:-1]
+    x1 = x[1:]
+    num = (x0 * x1).mean(dim=(0, 1))
+    den = (x * x).mean(dim=(0, 1)) + 1e-8
+    return num / den
+
+
+def arma_distribution_diagnostics(
+    real_standardized: np.ndarray,
+    generated_standardized: torch.Tensor | np.ndarray,
+    asset_names: list[str] | None = None,
+) -> tuple[pd.DataFrame, dict[str, float]]:
     """
-    Compare real test returns against generated autoregressive paths.
+    Match the diagnostics in the original ARMA notebook.
 
     Parameters
     ----------
-    real_series:
-        Real returns with shape [T, D].
-    generated_paths:
-        Generated returns with shape [T, S, D], where S is number of paths.
-    asset_names:
-        Optional list of length D.
-
-    Returns
-    -------
-    diagnostics_df, summary
-        diagnostics_df has per-asset real/generated mean, std, and ACF1.
-        summary contains MAE metrics across assets.
+    real_standardized:
+        Validation returns, shape [T_valid, D].
+    generated_standardized:
+        Generated returns, shape [horizon, num_samples, D].
     """
-    real_series = np.asarray(real_series, dtype=np.float64)
-    generated_paths = np.asarray(generated_paths, dtype=np.float64)
+    if isinstance(generated_standardized, np.ndarray):
+        gen_t = torch.as_tensor(generated_standardized, dtype=torch.float32)
+    else:
+        gen_t = generated_standardized.detach().cpu().float()
 
-    if real_series.ndim != 2:
-        raise ValueError(f"real_series must have shape [T, D], got {real_series.shape}")
-    if generated_paths.ndim != 3:
-        raise ValueError(f"generated_paths must have shape [T, S, D], got {generated_paths.shape}")
-    if generated_paths.shape[0] != real_series.shape[0] or generated_paths.shape[2] != real_series.shape[1]:
-        raise ValueError(
-            "generated_paths must match real_series in time and assets: "
-            f"real={real_series.shape}, generated={generated_paths.shape}"
-        )
-
-    T, S, D = generated_paths.shape
+    real = np.asarray(real_standardized, dtype=np.float32)
+    D = real.shape[1]
     if asset_names is None:
-        asset_names = [f"Asset_{i}" for i in range(D)]
+        asset_names = [f"Asset_{i+1}" for i in range(D)]
 
-    gen_flat = generated_paths.reshape(T * S, D)
+    real_mean = real.mean(axis=0)
+    real_std = real.std(axis=0)
+    real_acf1 = acf1_numpy_centered(real)
 
-    real_mean = real_series.mean(axis=0)
-    gen_mean = gen_flat.mean(axis=0)
+    gen_flat = gen_t.reshape(-1, gen_t.shape[-1])
+    gen_mean = gen_flat.mean(dim=0).numpy()
+    gen_std = gen_flat.std(dim=0).numpy()
+    gen_acf1 = acf1_torch_scenarios_centered(gen_t).numpy()
 
-    real_std = real_series.std(axis=0, ddof=0)
-    gen_std = gen_flat.std(axis=0, ddof=0)
-
-    real_acf1 = acf1_numpy_centered(real_series)
-    gen_acf1_by_path = np.stack(
-        [acf1_numpy_centered(generated_paths[:, s, :]) for s in range(S)],
-        axis=0,
-    )
-    gen_acf1 = np.nanmean(gen_acf1_by_path, axis=0)
-
-    diagnostics_df = pd.DataFrame(
-        {
-            "asset": list(asset_names),
-            "real_mean": real_mean,
-            "gen_mean": gen_mean,
-            "mean_abs_error": np.abs(real_mean - gen_mean),
-            "real_std": real_std,
-            "gen_std": gen_std,
-            "std_abs_error": np.abs(real_std - gen_std),
-            "real_acf1": real_acf1,
-            "gen_acf1": gen_acf1,
-            "acf1_abs_error": np.abs(real_acf1 - gen_acf1),
-        }
-    )
+    df = pd.DataFrame({
+        "asset": asset_names,
+        "real_mean": real_mean,
+        "gen_mean": gen_mean,
+        "abs_mean_error": np.abs(real_mean - gen_mean),
+        "real_std": real_std,
+        "gen_std": gen_std,
+        "abs_std_error": np.abs(real_std - gen_std),
+        "real_acf1": real_acf1,
+        "gen_acf1": gen_acf1,
+        "abs_acf1_error": np.abs(real_acf1 - gen_acf1),
+    })
 
     summary = {
-        "Mean MAE": float(diagnostics_df["mean_abs_error"].mean()),
-        "Std MAE": float(diagnostics_df["std_abs_error"].mean()),
-        "ACF1 MAE": float(diagnostics_df["acf1_abs_error"].mean()),
+        "Mean MAE": float(df["abs_mean_error"].mean()),
+        "Std MAE": float(df["abs_std_error"].mean()),
+        "ACF1 MAE": float(df["abs_acf1_error"].mean()),
     }
-
-    return diagnostics_df, summary
-
-
-def correlation_mae(real_series: np.ndarray, generated_paths: np.ndarray) -> float:
-    """
-    Mean absolute difference between real and average generated correlation matrices.
-
-    generated_paths should have shape [T, S, D]. The generated correlation matrix
-    is computed for each generated path and then averaged across paths.
-    """
-    real_series = np.asarray(real_series, dtype=np.float64)
-    generated_paths = np.asarray(generated_paths, dtype=np.float64)
-
-    real_corr = np.corrcoef(real_series.T)
-    gen_corrs = np.stack(
-        [np.corrcoef(generated_paths[:, s, :].T) for s in range(generated_paths.shape[1])],
-        axis=0,
-    )
-    gen_corr = np.nanmean(gen_corrs, axis=0)
-
-    mask = ~np.eye(real_corr.shape[0], dtype=bool)
-    return float(np.nanmean(np.abs(real_corr[mask] - gen_corr[mask])))
+    return df, summary

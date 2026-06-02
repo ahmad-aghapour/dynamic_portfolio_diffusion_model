@@ -15,11 +15,9 @@ portfolio_diffusion/
   generation.py    # scenario generation helpers
   portfolio.py     # Markowitz, backtest, stats, RL scenario saving
   plotting.py      # wealth/weights/turnover plots
-  simulation.py    # synthetic ARMA simulator
-  evaluation.py    # mean/std/ACF1/correlation diagnostics
+  simulation.py    # optional ARMA simulator
 notebooks/
   ff49_diffusion_pipeline.ipynb
-  arma_synthetic_experiment.ipynb
 outputs/           # created artifacts; ignored by git
 ```
 
@@ -43,19 +41,13 @@ pip install -r requirements.txt
 
 ## Run
 
-Open and run the real-data FF49 notebook:
+Open and run:
 
 ```text
 notebooks/ff49_diffusion_pipeline.ipynb
 ```
 
-Or run the synthetic ARMA experiment notebook:
-
-```text
-notebooks/arma_synthetic_experiment.ipynb
-```
-
-Both notebooks train the diffusion model, run rolling generated-scenario Markowitz backtests, plot wealth trajectories, compute performance statistics, and save generated scenario tensors plus RNN conditioning features for RL. The ARMA notebook also computes generated-path diagnostics: Mean MAE, Std MAE, ACF1 MAE, and correlation MAE.
+The notebook trains the diffusion model, runs the rolling backtest, and saves generated scenario tensors for RL.
 
 ## RL scenario output
 
@@ -75,7 +67,6 @@ asset_names                   # [num_assets]
 actual_next_returns           # [T_test, num_assets]
 history_windows_raw           # [T_test, context_length, num_assets]
 history_windows_standardized  # [T_test, context_length, num_assets]
-rnn_features                  # [T_test, num_scenarios, rnn_hidden_dim]
 gm_weights                    # [T_test, num_assets]
 scenario_means                # [T_test, num_assets]
 scenario_covs                 # [T_test, num_assets, num_assets]
@@ -86,14 +77,9 @@ For each time step `t` in RL:
 ```python
 state_t = history_windows_raw[t]
 scenario_set_t = scenarios_raw[t]
-rnn_feature_set_t = rnn_features[t]
 realized_return_t = actual_next_returns[t]
 ```
 
 ## Notes
 
 The current training uses repo-style sequence-to-sequence conditioning: each 12-month window contributes a target for every RNN hidden state, producing targets with shape `[batch, context_length, prediction_length, num_assets]`. The diffusion loss flattens `batch * context_length` during training.
-
-## Relation to the reference repo
-
-The reference implementation uses the diffusion model's RNN output as the scenario feature for TD3. In its real-data TD3 code, the observation is built by concatenating `feature[time]`, wealth, and the multiplier. Its scenario generator fills `feature` from the diffusion model's sampled RNN features. This project now saves the same kind of scaled RNN conditioning feature as `rnn_features`.

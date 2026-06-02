@@ -120,7 +120,6 @@ def run_generative_markowitz_backtest(
     actual_next_returns_list = []
     history_windows_raw_list = []
     history_windows_std_list = []
-    rnn_features_list = []
 
     for date in test_dates:
         t = full_dates.get_loc(date)
@@ -133,13 +132,12 @@ def run_generative_markowitz_backtest(
         actual_next_raw = full_raw[t]
         history_standardized = (history_raw - mean_vec) / std_vec
 
-        scenarios_std, rnn_features = generate_next_month_scenarios(
+        scenarios_std = generate_next_month_scenarios(
             model=model,
             history_window_standardized=history_standardized,
             num_scenarios=num_scenarios,
             eta=eta,
             clip_x0=None,
-            return_features=True,
         )
         scenarios_raw = scenarios_std.numpy() * std_vec + mean_vec
 
@@ -148,7 +146,6 @@ def run_generative_markowitz_backtest(
         actual_next_returns_list.append(actual_next_raw.copy())
         history_windows_raw_list.append(history_raw.copy())
         history_windows_std_list.append(history_standardized.copy())
-        rnn_features_list.append(rnn_features.numpy().copy())
 
         mu_hat = scenarios_raw.mean(axis=0)
         cov_hat = np.cov(scenarios_raw.T)
@@ -186,9 +183,6 @@ def run_generative_markowitz_backtest(
         "actual_next_returns": np.asarray(actual_next_returns_list),
         "history_windows_raw": np.asarray(history_windows_raw_list),
         "history_windows_standardized": np.asarray(history_windows_std_list),
-        # Scaled RNN conditioning features used to generate each scenario.
-        # Shape: [num_test_months, num_scenarios, rnn_hidden_dim]
-        "rnn_features": np.asarray(rnn_features_list),
     }
 
 
@@ -289,9 +283,8 @@ def save_scenario_dataset_for_rl(backtest_results, asset_names, output_dir="outp
     Save generated scenario dataset for reinforcement learning.
 
     Outputs:
-      - {prefix}_scenarios_for_rl.npz: compact tensors, including RNN features
+      - {prefix}_scenarios_for_rl.npz: compact tensors
       - {prefix}_scenarios_for_rl_panel.csv: one row per date x scenario
-      - {prefix}_rnn_features_for_rl_panel.csv: one row per date x scenario
       - {prefix}_actual_next_returns_for_rl.csv: realized next-month returns
       - {prefix}_state_windows_for_rl.csv: previous context window per date
     """
@@ -306,10 +299,10 @@ def save_scenario_dataset_for_rl(backtest_results, asset_names, output_dir="outp
     history_raw = backtest_results["history_windows_raw"]
     history_std = backtest_results["history_windows_standardized"]
     gm_weights = backtest_results["gm_weights"]
-    rnn_features = backtest_results.get("rnn_features")
 
     npz_path = output_dir / f"{prefix}_scenarios_for_rl.npz"
-    npz_payload = dict(
+    np.savez_compressed(
+        npz_path,
         scenarios_raw=scenarios_raw,
         scenarios_standardized=scenarios_std,
         dates=scenario_dates.astype(str).to_numpy(),
@@ -321,9 +314,6 @@ def save_scenario_dataset_for_rl(backtest_results, asset_names, output_dir="outp
         scenario_means=backtest_results["scenario_means"],
         scenario_covs=backtest_results["scenario_covs"],
     )
-    if rnn_features is not None:
-        npz_payload["rnn_features"] = rnn_features
-    np.savez_compressed(npz_path, **npz_payload)
 
     T, S, N = scenarios_raw.shape
     scenario_panel_df = pd.DataFrame(scenarios_raw.reshape(T * S, N), columns=asset_names)
@@ -331,16 +321,6 @@ def save_scenario_dataset_for_rl(backtest_results, asset_names, output_dir="outp
     scenario_panel_df.insert(0, "date", np.repeat(scenario_dates.astype(str).to_numpy(), S))
     panel_path = output_dir / f"{prefix}_scenarios_for_rl_panel.csv"
     scenario_panel_df.to_csv(panel_path, index=False)
-
-    feature_path = None
-    if rnn_features is not None:
-        _, _, H = rnn_features.shape
-        feature_cols = [f"rnn_feature_{i:03d}" for i in range(H)]
-        rnn_feature_df = pd.DataFrame(rnn_features.reshape(T * S, H), columns=feature_cols)
-        rnn_feature_df.insert(0, "scenario_id", np.tile(np.arange(S), T))
-        rnn_feature_df.insert(0, "date", np.repeat(scenario_dates.astype(str).to_numpy(), S))
-        feature_path = output_dir / f"{prefix}_rnn_features_for_rl_panel.csv"
-        rnn_feature_df.to_csv(feature_path, index=False)
 
     actual_next_returns_df = pd.DataFrame(actual_next_returns, index=scenario_dates, columns=asset_names)
     actual_path = output_dir / f"{prefix}_actual_next_returns_for_rl.csv"
@@ -361,7 +341,6 @@ def save_scenario_dataset_for_rl(backtest_results, asset_names, output_dir="outp
     return {
         "npz": npz_path,
         "scenario_panel_csv": panel_path,
-        "rnn_features_csv": feature_path,
         "actual_returns_csv": actual_path,
         "state_windows_csv": states_path,
     }
