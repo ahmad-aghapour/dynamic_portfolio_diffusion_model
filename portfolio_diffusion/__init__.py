@@ -16,6 +16,8 @@ from .evaluation import (
     acf1_numpy_centered,
     acf1_torch_scenarios_centered,
     arma_distribution_diagnostics,
+    historical_mean_covariance_for_dates,
+    generated_scenario_diagnostics,
 )
 from .portfolio import (
     run_generative_markowitz_backtest,
@@ -25,4 +27,7 @@ from .portfolio import (
     build_weight_dataframe,
     build_average_weights_dataframe,
     save_scenario_dataset_for_rl,
+    diffusion_inverse_vol_tilt_weights,
+    run_portfolio_variants_from_scenarios,
 )
+

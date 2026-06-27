@@ -344,3 +344,168 @@ def save_scenario_dataset_for_rl(backtest_results, asset_names, output_dir="outp
         "actual_returns_csv": actual_path,
         "state_windows_csv": states_path,
     }
+
+def _scenario_mean_cov(scenarios_t, cov_shrinkage=0.0, ridge=1e-6):
+    scenarios_t = np.asarray(scenarios_t, dtype=np.float64)
+    mu = scenarios_t.mean(axis=0)
+    cov = np.cov(scenarios_t, rowvar=False)
+    cov = 0.5 * (cov + cov.T)
+
+    if cov_shrinkage > 0.0:
+        diag_cov = np.diag(np.diag(cov))
+        cov = (1.0 - cov_shrinkage) * cov + cov_shrinkage * diag_cov
+
+    cov = cov + ridge * np.eye(cov.shape[0])
+    return mu, cov
+
+
+def _apply_weight_cap_and_normalize(weights, weight_cap=None):
+    weights = np.asarray(weights, dtype=np.float64)
+    weights = np.maximum(weights, 0.0)
+
+    if weight_cap is None:
+        total = weights.sum()
+        return weights / total if total > 0.0 else np.ones_like(weights) / len(weights)
+
+    cap = float(weight_cap)
+    n = len(weights)
+    if cap * n < 1.0 - 1e-12:
+        raise ValueError("weight_cap is too small to allow weights to sum to 1.")
+
+    weights = weights / weights.sum() if weights.sum() > 0.0 else np.ones(n) / n
+    for _ in range(100):
+        over = weights > cap
+        if not np.any(over):
+            break
+        weights[over] = cap
+        remaining = 1.0 - weights[over].sum()
+        under = ~over
+        if not np.any(under):
+            break
+        under_sum = weights[under].sum()
+        weights[under] = remaining / under.sum() if under_sum <= 0.0 else weights[under] * remaining / under_sum
+
+    weights = np.minimum(weights, cap)
+    return weights / weights.sum()
+
+
+def diffusion_inverse_vol_tilt_weights(cov, tilt_strength=0.50, weight_cap=None):
+    """
+    Blend equal weight with inverse generated volatility weights.
+
+    tilt_strength=0 gives equal weight; tilt_strength=1 gives pure inverse-vol.
+    """
+    cov = np.asarray(cov, dtype=np.float64)
+    n = cov.shape[0]
+    equal_weight = np.ones(n) / n
+    vol = np.sqrt(np.clip(np.diag(cov), 1e-12, None))
+    inv_vol = 1.0 / vol
+    inv_vol = inv_vol / inv_vol.sum()
+    weights = (1.0 - tilt_strength) * equal_weight + tilt_strength * inv_vol
+    return _apply_weight_cap_and_normalize(weights, weight_cap=weight_cap)
+
+
+def run_portfolio_variants_from_scenarios(
+    backtest_results,
+    monthly_returns_df,
+    risk_aversion=20.0,
+    cov_shrinkage=0.50,
+    historical_lookback=120,
+    mean_shrinkage=0.75,
+    weight_cap=0.10,
+    risk_tilt_strength=0.50,
+):
+    """
+    Reuse generated scenarios to test robust portfolio variants.
+
+    Variants:
+      - equal_weight
+      - generated_markowitz_capped
+      - generated_markowitz_mean_shrunk
+      - equal_weight_diffusion_risk_tilt
+
+    mean_shrinkage is the weight on historical mean in the shrunk mean:
+        mu = (1 - mean_shrinkage) * generated_mu + mean_shrinkage * historical_mu
+    """
+    from .evaluation import historical_mean_covariance_for_dates
+
+    scenarios = np.asarray(backtest_results["scenarios_raw"], dtype=np.float64)
+    actual = np.asarray(backtest_results["actual_next_returns"], dtype=np.float64)
+    dates = pd.DatetimeIndex(backtest_results["dates"])
+    T, _, N = scenarios.shape
+
+    hist_mean, _, _ = historical_mean_covariance_for_dates(
+        monthly_returns_df=monthly_returns_df,
+        dates=dates,
+        lookback=historical_lookback,
+        cov_shrinkage=0.0,
+    )
+
+    weights_by_strategy = {
+        "equal_weight": np.zeros((T, N)),
+        "generated_markowitz_capped": np.zeros((T, N)),
+        "generated_markowitz_mean_shrunk": np.zeros((T, N)),
+        "equal_weight_diffusion_risk_tilt": np.zeros((T, N)),
+    }
+    returns_by_strategy = {name: np.zeros(T) for name in weights_by_strategy}
+
+    equal_weight = np.ones(N) / N
+
+    for t in range(T):
+        mu_gen, cov_gen = _scenario_mean_cov(
+            scenarios[t],
+            cov_shrinkage=cov_shrinkage,
+            ridge=1e-6,
+        )
+        mu_shrunk = (1.0 - mean_shrinkage) * mu_gen + mean_shrinkage * hist_mean[t]
+
+        strategy_weights = {
+            "equal_weight": equal_weight,
+            "generated_markowitz_capped": solve_markowitz_long_only(
+                mu=mu_gen,
+                cov=cov_gen,
+                risk_aversion=risk_aversion,
+                cov_jitter=1e-6,
+                weight_cap=weight_cap,
+            ),
+            "generated_markowitz_mean_shrunk": solve_markowitz_long_only(
+                mu=mu_shrunk,
+                cov=cov_gen,
+                risk_aversion=risk_aversion,
+                cov_jitter=1e-6,
+                weight_cap=weight_cap,
+            ),
+            "equal_weight_diffusion_risk_tilt": diffusion_inverse_vol_tilt_weights(
+                cov=cov_gen,
+                tilt_strength=risk_tilt_strength,
+                weight_cap=weight_cap,
+            ),
+        }
+
+        for name, weights in strategy_weights.items():
+            weights_by_strategy[name][t] = weights
+            returns_by_strategy[name][t] = float(weights @ actual[t])
+
+    rows = []
+    for name, returns in returns_by_strategy.items():
+        stats = performance_stats(returns)
+        stats["Strategy"] = name
+        stats["Average Turnover"] = compute_rebalance_turnover(
+            weights_by_strategy[name],
+            actual,
+        ).mean()
+        stats["Average Max Weight"] = weights_by_strategy[name].max(axis=1).mean()
+        stats["Average Effective N"] = np.mean(
+            1.0 / np.sum(weights_by_strategy[name] ** 2, axis=1)
+        )
+        rows.append(stats)
+
+    stats_df = pd.DataFrame(rows).set_index("Strategy")
+    returns_df = pd.DataFrame(returns_by_strategy, index=dates)
+
+    return {
+        "stats": stats_df,
+        "returns": returns_df,
+        "weights": weights_by_strategy,
+    }
+
