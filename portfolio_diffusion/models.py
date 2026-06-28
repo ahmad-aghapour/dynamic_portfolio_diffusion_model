@@ -94,6 +94,37 @@ class Up(nn.Module):
         x = torch.cat([skip, x], dim=1)
         return self.block(x, cond_vec)
 
+
+
+class ConditionalMLPDenoiser(nn.Module):
+    def __init__(self, asset_dim, cond_dim, time_embed_dim=128, hidden_dim=256):
+        super().__init__()
+
+        self.time_mlp = nn.Sequential(
+            SinusoidalPositionEmbeddings(time_embed_dim),
+            nn.Linear(time_embed_dim, time_embed_dim),
+            nn.SiLU(),
+        )
+
+        self.net = nn.Sequential(
+            nn.Linear(asset_dim + cond_dim + time_embed_dim, hidden_dim),
+            nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, asset_dim),
+        )
+
+    def forward(self, x, t, cond):
+        x_vec = x[:, 0, :]
+        cond_vec = cond[:, 0, :]
+        time_vec = self.time_mlp(t)
+
+        h = torch.cat([x_vec, cond_vec, time_vec], dim=-1)
+        eps = self.net(h)
+
+        return eps.unsqueeze(1)
 class UNet1DSameRes(nn.Module):
     """
     Same-resolution 1D U-Net.
@@ -218,13 +249,23 @@ class ConditionalRecurrentDDPM(nn.Module):
             batch_first=True,
         )
 
-        self.denoiser = UNet1DSameRes(
-            in_channels=cfg.prediction_length,
-            cond_channels=1,
-            time_embed_dim=cfg.time_embed_dim,
-            base_channels=cfg.unet_base_channels,
-            depth=cfg.unet_depth,
-        )
+        if cfg.denoiser_type.lower() == "mlp":
+            self.denoiser = ConditionalMLPDenoiser(
+                asset_dim=cfg.input_dim,
+                cond_dim=cfg.rnn_hidden_dim,
+                time_embed_dim=cfg.time_embed_dim,
+                hidden_dim=256,
+            )
+        elif cfg.denoiser_type.lower() == "unet":
+                self.denoiser = UNet1DSameRes(
+                    in_channels=cfg.prediction_length,
+                    cond_channels=1,
+                    time_embed_dim=cfg.time_embed_dim,
+                    base_channels=cfg.unet_base_channels,
+                    depth=cfg.unet_depth,
+                )
+        else:
+                raise ValueError(f"Unknown denoiser_type: {cfg.denoiser_type}")
 
         betas = torch.linspace(cfg.beta_start, cfg.beta_end, cfg.diffusion_steps, dtype=torch.float32)
         alphas = 1.0 - betas
@@ -370,13 +411,35 @@ class ConditionalRecurrentDDPM(nn.Module):
 
       eps_pred = self.predict_eps(x_t, t, cond_flat)
 
-      loss = F.mse_loss(eps_pred, noise)
+      seq_loss  = F.mse_loss(eps_pred, noise)
+      target_last = target[:, -1, :, :]          # [B, Lp, D]
+      cond_last = cond_seq[:, -1, :].unsqueeze(1)
+
+      t_last = torch.randint(
+            0,
+            self.num_steps,
+            size=(B,),
+            device=context.device,
+            dtype=torch.long,
+        )
+
+      noise_last = torch.randn_like(target_last)
+      x_t_last = self.q_sample(target_last, t_last, noise_last)
+      eps_pred_last = self.predict_eps(x_t_last, t_last, cond_last)
+
+      last_loss = F.mse_loss(eps_pred_last, noise_last)  
+      loss = (
+            self.cfg.seq_loss_weight * seq_loss
+            + self.cfg.last_loss_weight * last_loss
+        )
 
       return loss, {
-          "loss": float(loss.detach().item()),
-          "mode": "seq2seq",
-          "effective_targets": B * Lc,
-      }
+            "loss": float(loss.detach().item()),
+            "seq_loss": float(seq_loss.detach().item()),
+            "last_loss": float(last_loss.detach().item()),
+            "mode": "seq2seq_weighted",
+            "effective_targets": B * Lc,
+        }
     def forward(
         self,
         context: torch.Tensor,

@@ -12,6 +12,10 @@ class DDPMConfig:
     context_length: int = 12
     prediction_length: int = 1
 
+    denoiser_type: str = "mlp"   # "mlp" or "unet"
+    seq_loss_weight: float = 0.2
+    last_loss_weight: float = 0.8
+
     rnn_type: str = "LSTM"  # "GRU" or "LSTM"
     rnn_hidden_dim: int = 128
     rnn_layers: int = 2
